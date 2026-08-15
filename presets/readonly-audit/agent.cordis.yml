@@ -1,0 +1,95 @@
+# The `readonly-audit` agent preset: a read-only security audit mode.
+#
+# It is a deliberately lean AGENT-PLANE composition. The host plane keeps the
+# sandbox/approval stack, filesystem provider, persistence, and user-questions
+# service; this preset contributes only read-capable tools plus the
+# `dsh-readonly-security-audit` mode plugin, which is the enforcement owner.
+#
+# The mode plugin starts with `active: true`, so every session created on this
+# preset is already in audit mode: no slash command is required to enter it.
+# `/readonly-audit off` still leaves the mode for that session, and
+# `/readonly-audit on` re-enters it.
+
+# ── identity ────────────────────────────────────────────────────────────────
+
+- id: persona
+  name: '@deepseek-ai/dsh-persona'
+  config:
+    text: >-
+      You are a security audit agent powered by the {{model}} model. Your working directory is {{cwd}}.
+      Read and analyze source code, dependency manifests, and configuration files to find
+      vulnerabilities, dangerous APIs, weak configuration, hard-coded secrets, and supply-chain risks.
+      The read-only security audit policy is enforced by the system; do not modify files except the
+      single user-approved report write.
+
+- id: agent-instructions
+  name: '@deepseek-ai/dsh-agent-instructions'
+  config:
+    maxBytes: 65536
+
+# ── shell ───────────────────────────────────────────────────────────────────
+
+# The executors stay in the host plane. These rows register the model-facing
+# shell tools; the audit plugin only lets them run under a confining executor,
+# and the host sandbox enforces the session's read-only file policy.
+- id: tool-bash
+  name: '@deepseek-ai/dsh-tool-bash'
+  disabled: !!js process.platform === 'win32'
+  config:
+    enableRunInBackground: false
+
+- id: tool-pwsh
+  name: '@deepseek-ai/dsh-tool-pwsh'
+  disabled: !!js process.platform !== 'win32'
+  config:
+    enableRunInBackground: false
+
+# ── filesystem reads (plus the report-file write) ──────────────────────────
+
+# `tool-fs` registers `read`, `read_image`, `write`, and `edit`. The audit
+# plugin rejects `write`/`edit` before dispatch unless the user approves that
+# exact single call (the report-file exception).
+- id: tool-fs
+  name: '@deepseek-ai/dsh-tool-fs'
+
+- id: tool-fs-search
+  name: '@deepseek-ai/dsh-tool-fs-search'
+  config:
+    sampleOverCapGlobResults: false
+
+# `view` is allowed read-only; `create`/`str_replace`/`insert` go through the
+# same one-shot approval gate as `write`/`edit`.
+- id: tool-str-replace-editor
+  name: '@deepseek-ai/dsh-tool-str-replace-editor'
+  config:
+    maxOutputChars: 16000
+
+# ── questions and web reads ────────────────────────────────────────────────
+
+- id: tool-ask-user
+  name: '@deepseek-ai/dsh-tool-ask-user'
+
+# Web search is read-only from the filesystem's point of view and is enabled
+# for dependency-advisory and supply-chain research. `web_fetch` stays off
+# here; a deployment with a configured fetch provider may enable it.
+- id: tool-web
+  name: '@deepseek-ai/dsh-tool-web'
+  config:
+    search: true
+    fetch: false
+    searchTimeoutMs: 60000
+
+# ── the audit-mode enforcement owner ───────────────────────────────────────
+
+# The plugin provides the `readonlyAudit` service, so it lives in an
+# entry-local realm exactly like the plan-mode row in the standard preset.
+- id: readonly-audit-realm
+  name: cordis:group
+  group: true
+  isolate:
+    readonlyAudit: true
+  config:
+    - id: readonly-security-audit
+      name: dsh-readonly-security-audit
+      config:
+        active: true

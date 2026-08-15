@@ -1,0 +1,709 @@
+/**
+ * read-only security audit mode for the DeepSeek Harness.
+ *
+ * The plugin is a deployment-independent mode layer:
+ * - The shipped `readonly-audit` agent preset mounts it with `active: true`, so
+ *   sessions created in that preset start in audit mode; a host instance can
+ *   instead use `/readonly-audit on|off|status` to switch one session manually.
+ * - Entering the mode appends durable session events and switches the shared
+ *   sandbox policy to `read-only`, so the existing kernel/process sandbox and
+ *   `dsh-fs-sandbox` reject every file mutation even if a future tool forgot
+ *   to ask this plugin.
+ * - A `tools/pre-execute` gate (registered `prepend`) is the second,
+ *   tool-registry-level fence: in audit mode every tool must be an allowlisted
+ *   reader or an explicitly approved single mutation. Unauthorized `write`,
+ *   `edit`, `str_replace_editor` mutations, shell commands without a confining
+ *   executor, and every non-allowlisted tool fail with an explicit
+ *   `[readonly-audit] 只读安全审计模式` message.
+ * - The model must choose report delivery BEFORE reading anything:
+ *   `choose_audit_report_delivery` asks the user for `dialog` or `file`.
+ *   A `file` choice is later written with the ordinary `write` tool; that one
+ *   call asks for approval and temporarily widens only that session to
+ *   `workspace-write`, then immediately returns to `read-only`.
+ *
+ * @module dsh-readonly-security-audit
+ */
+
+import { isAbsolute, normalize, sep } from 'node:path'
+import { Context, Service } from '@deepseek-ai/cordis'
+import type { Agent, PreStepDecision } from '@deepseek-ai/dsh-agent'
+import { createUserMessage } from '@deepseek-ai/dsh-llm'
+import type { SandboxMode } from '@deepseek-ai/dsh-sandbox'
+import { setSandboxMode } from '@deepseek-ai/dsh-sandbox-policy'
+import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
+import type {} from '@deepseek-ai/dsh-system-prompt'
+import { defineTool } from '@deepseek-ai/dsh-tools'
+import type { PreToolDecision, ToolExecution, ToolExecutionToken } from '@deepseek-ai/dsh-tools'
+import type { ApprovalPolicy } from '@deepseek-ai/dsh-user-approval'
+import type {} from '@deepseek-ai/dsh-user-approval'
+import { UserQuestionError } from '@deepseek-ai/dsh-user-questions'
+import type {} from '@deepseek-ai/dsh-user-questions'
+// Type-only: resolves `ctx.commands` for the optional slash-command child.
+import type {} from '@deepseek-ai/dsh-commands'
+
+declare module '@deepseek-ai/dsh-session/types' {
+  interface SessionEventMap {
+    /**
+     * Whether read-only security audit mode is in force from this point on.
+     * Log-only, non-surface, whole-value replace. The last event wins.
+     */
+    'readonly-audit/mode': {
+      active: boolean
+      /** Sandbox mode to restore when leaving the mode (entry events only). */
+      previousSandbox?: SandboxMode
+      /** Approval policy to restore when leaving the mode (entry events only). */
+      previousApproval?: ApprovalPolicy
+    }
+    /**
+     * The selected audit-report delivery method, or `null` when no choice is
+     * outstanding for the current audit run. The last event wins.
+     */
+    'readonly-audit/delivery': {
+      delivery: AuditReportDelivery | null
+      /** Default report path used for `file` delivery. */
+      reportPath?: string
+    }
+  }
+}
+
+declare module '@deepseek-ai/cordis' {
+  interface Context {
+    readonlyAudit: ReadonlyAuditController
+  }
+}
+
+/** Delivery choices for the final audit report. */
+export type AuditReportDelivery = 'dialog' | 'file'
+
+/** Slash command name. */
+export const COMMAND_NAME = 'readonly-audit'
+
+/** Model-facing tool that asks the delivery question. */
+export const CHOOSE_DELIVERY_TOOL = 'choose_audit_report_delivery'
+
+/** Default report file name, resolved against the session workspace. */
+export const DEFAULT_REPORT_PATH = 'SECURITY_AUDIT_REPORT.md'
+
+/** User-visible option labels owned by this plugin. */
+export const DELIVERY_DIALOG_LABEL = '对话直接回复'
+export const DELIVERY_FILE_LABEL = '生成报告文件'
+
+/** Question id echoed by the user-questions provider. */
+const DELIVERY_QUESTION_ID = 'readonly-audit-report-delivery'
+
+/** Denial prefix shared by every model-facing blocked-tool message. */
+const READONLY_PREFIX = '[readonly-audit] 只读安全审计模式'
+
+/**
+ * Tools that only read code, configuration, or the outside world. `bash` and
+ * `pwsh` are handled separately because they are allowlisted only when the
+ * mounted executor confines commands.
+ */
+const READONLY_TOOLS = new Set([
+  'read',
+  'read_image',
+  'glob',
+  'grep',
+  'web_search',
+  'web_fetch',
+  'job_output',
+  'job_list',
+  'job_kill',
+  'ask_user_question',
+  CHOOSE_DELIVERY_TOOL,
+])
+
+/** Shell tools whose file effects must be enforced by the OS sandbox. */
+const SHELL_TOOLS = new Set(['bash', 'pwsh'])
+
+/** Whole-call file mutators. */
+const FILE_MUTATOR_TOOLS = new Set(['write', 'edit'])
+
+/** `str_replace_editor` commands that mutate files. */
+const STR_REPLACE_MUTATIONS = new Set(['create', 'str_replace', 'insert'])
+
+/** Plugin config. Every field is optional and deployment-independent. */
+export interface Config {
+  /**
+   * Whether this plugin instance starts every agent in audit mode without a
+   * `/readonly-audit on` command. The shipped `readonly-audit` agent preset
+   * sets this to `true`; ordinary host installs leave it `false` and activate
+   * the mode per session through the slash command.
+   */
+  active?: boolean
+  /**
+   * Relative report path for `file` delivery. It must stay inside the session
+   * workspace (absolute paths and `..` traversal are refused).
+   */
+  reportPath?: string
+  /** Additional tool names allowed in audit mode (deployment-specific readers). */
+  extraReadOnlyTools?: readonly string[]
+  /** Additional tool names treated as whole-call file mutators. */
+  extraMutatingTools?: readonly string[]
+}
+
+/** Config after validation and defaults. */
+export interface ResolvedConfig {
+  readonly active: boolean
+  readonly reportPath: string
+  readonly extraReadOnlyTools: ReadonlySet<string>
+  readonly extraMutatingTools: ReadonlySet<string>
+}
+
+/**
+ * Read one `readonly-audit/mode` value from the durable log. With no override
+ * event the `defaultActive` value wins, which is how an `active: true` preset
+ * instance starts every session already in audit mode.
+ */
+export function foldAuditMode(
+  events: readonly SessionEvent[],
+  end = events.length,
+  defaultActive = false,
+): boolean {
+  let active = defaultActive
+  let index = 0
+  for (const event of events) {
+    if (index >= end) break
+    index += 1
+    if (event.type === 'readonly-audit/mode') active = event.data.active
+  }
+  return active
+}
+
+/** Read the last selected delivery method, or `null` before a choice. */
+export function foldAuditDelivery(events: readonly SessionEvent[]): AuditReportDelivery | null {
+  let delivery: AuditReportDelivery | null = null
+  for (const event of events) {
+    if (event.type === 'readonly-audit/delivery') delivery = event.data.delivery
+  }
+  return delivery
+}
+
+/** The latest entry event's saved previous sandbox mode, if any. */
+export function foldPreviousSandbox(events: readonly SessionEvent[]): SandboxMode | undefined {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index] as SessionEvent
+    if (event.type === 'readonly-audit/mode' && event.data.active) return event.data.previousSandbox
+  }
+  return undefined
+}
+
+/** The latest entry event's saved previous approval policy, if any. */
+export function foldPreviousApproval(events: readonly SessionEvent[]): ApprovalPolicy | undefined {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index] as SessionEvent
+    if (event.type === 'readonly-audit/mode' && event.data.active) return event.data.previousApproval
+  }
+  return undefined
+}
+
+/** Validate and detach plugin configuration. */
+export function resolveConfig(config: Config = {}): ResolvedConfig {
+  const active = config.active ?? false
+  if (typeof active !== 'boolean') {
+    throw new Error('readonly-security-audit: active must be a boolean')
+  }
+  const reportPath = config.reportPath ?? DEFAULT_REPORT_PATH
+  if (typeof reportPath !== 'string' || reportPath.trim().length === 0) {
+    throw new Error('readonly-security-audit: reportPath must be a non-empty string')
+  }
+  if (reportPath.includes('\0')) {
+    throw new Error('readonly-security-audit: reportPath must not contain NUL')
+  }
+  const normalizedReport = normalize(reportPath)
+  if (isAbsolute(reportPath) || normalizedReport === '..' || normalizedReport.startsWith(`..${sep}`)) {
+    throw new Error('readonly-security-audit: reportPath must stay inside the session workspace')
+  }
+
+  const extraReadOnlyTools = new Set(assertToolNameList(config.extraReadOnlyTools, 'extraReadOnlyTools'))
+  const extraMutatingTools = new Set(assertToolNameList(config.extraMutatingTools, 'extraMutatingTools'))
+  return {
+    active,
+    reportPath: reportPath.trim(),
+    extraReadOnlyTools,
+    extraMutatingTools,
+  }
+}
+
+/** Validate an optional tool-name list config field. */
+function assertToolNameList(value: readonly string[] | undefined, field: string): readonly string[] {
+  if (value === undefined) return []
+  if (Array.isArray(value) === false) {
+    throw new Error(`readonly-security-audit: ${field} must be an array of non-empty strings`)
+  }
+  for (const tool of value) {
+    if (typeof tool !== 'string' || tool.trim().length === 0) {
+      throw new Error(`readonly-security-audit: ${field} entries must be non-empty strings`)
+    }
+  }
+  return value
+}
+
+/** Best-effort message extraction for approval/denial rendering. */
+function messageOf(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
+
+/** The parsed arguments of one tool execution, when they are an object. */
+function argsRecord(arguments_: unknown): Record<string, unknown> {
+  return typeof arguments_ === 'object' && arguments_ !== null
+    ? arguments_ as Record<string, unknown>
+    : {}
+}
+
+/** Whether `str_replace_editor` arguments select a mutating command. */
+function isStrReplaceMutation(args: Record<string, unknown>): boolean {
+  return STR_REPLACE_MUTATIONS.has(String(args.command ?? ''))
+}
+
+/** Whether the call is an unapproved file mutation. */
+function isFileMutation(name: string, args: Record<string, unknown>, extraMutatingTools: ReadonlySet<string>): boolean {
+  if (FILE_MUTATOR_TOOLS.has(name) || extraMutatingTools.has(name)) return true
+  return name === 'str_replace_editor' && isStrReplaceMutation(args)
+}
+
+/**
+ * Owns the mode: durable state, the slash command, the delivery chooser,
+ * prompt guidance, and the two enforcement fences.
+ */
+export class ReadonlyAuditController extends Service {
+  static inject = ['tools', 'systemPrompt', 'sandboxPolicy', 'userQuestions']
+
+  private readonly config: ResolvedConfig
+
+  /**
+   * Approved single mutations that are currently executing. Keyed by session
+   * so the post-execute fence can restore `read-only` exactly once.
+   */
+  private readonly approvedMutations = new WeakMap<Session, Set<ToolExecutionToken>>()
+
+  constructor(ctx: Context, config: Config = {}) {
+    super(ctx, 'readonlyAudit')
+    this.config = resolveConfig(config)
+    let disposed = false
+
+    ctx.systemPrompt.section({
+      name: 'readonly-audit:policy',
+      order: 40,
+      text: (context) => {
+        const agent = context.agent
+        if (agent === undefined || this.isActive(agent.session) === false) return ''
+        return this.policyText(agent)
+      },
+    })
+
+    // Outermost tool gate: in audit mode this plugin decides every call and
+    // deliberately does not delegate to later pre-execute listeners.
+    ctx.on('tools/pre-execute', async (exec, next) => {
+      if (exec.agent === undefined || this.isActive(exec.agent.session) === false) {
+        return await next()
+      }
+      return await this.preExecute(exec)
+    }, true)
+
+    // Repair drift at every accepted pre-step boundary, before the next
+    // request's sandbox-policy context is assembled.
+    ctx.on('agent/pre-step', async (
+      { agent },
+      next,
+    ): Promise<PreStepDecision> => {
+      const decision = await next()
+      if (decision.kind === 'reject') return decision
+      if (this.isActive(agent.session)) {
+        try {
+          this.enforceStandingSandbox(agent.session)
+        } catch (error: unknown) {
+          ctx.logger.warn('readonly-security-audit: failed to restore read-only sandbox at pre-step: %o', error)
+        }
+      }
+      return decision
+    })
+
+    // Restore the standing read-only sandbox as soon as an approved mutation
+    // settles, before any later post-execute observer runs.
+    ctx.on('tools/post-execute', async (exec, _result, next) => {
+      if (exec.agent !== undefined) this.restoreAfterApprovedMutation(exec.agent, exec.token)
+      return await next()
+    }, true)
+
+    // The delivery chooser is the only tool allowed before a choice exists.
+    const reportPath = this.config.reportPath
+    // The chooser object's method shorthand rebinds `this`; capture the
+    // controller's mode check for use inside that object.
+    const isActive = (session: Session): boolean => this.isActive(session)
+    ctx.tools.register(defineTool({
+      name: CHOOSE_DELIVERY_TOOL,
+      description: 'Use this tool FIRST whenever read-only security audit mode is active and the report '
+        + 'delivery method has not been chosen yet. It asks the user to choose between delivering the '
+        + 'final security audit report directly in the conversation, or writing it to a report file. '
+        + 'Choosing the file option later triggers a one-time user approval for that single write.',
+      parameters: {},
+      output: {
+        schema: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            delivery: { type: 'string', required: true, enum: ['dialog', 'file'] },
+            report_path: { type: 'string', description: 'Default report path for file delivery.' },
+          },
+        },
+        render: (_args, value) => [{
+          type: 'text',
+          text: value.delivery === 'file'
+            ? `The user chose file delivery. Write the final report to ${String(value.report_path ?? reportPath)} at the end of the audit; that write requires one-time approval.`
+            : 'The user chose conversation delivery. Present the final report directly in the conversation.',
+        }],
+      },
+      async execute(_args, exec) {
+        const agent = requireAgent(exec)
+        if (isActive(agent.session) === false) {
+          throw new Error(`${CHOOSE_DELIVERY_TOOL} is only available in read-only security audit mode`)
+        }
+        if (disposed) {
+          throw new Error('the read-only audit service was reloaded; switch the mode off and on again')
+        }
+        let answer
+        try {
+          answer = await ctx.userQuestions.ask({
+            questions: [{
+              id: DELIVERY_QUESTION_ID,
+              header: '审计报告交付方式',
+              question: '安全审计完成后，你希望如何接收审计报告？',
+              options: [
+                {
+                  label: DELIVERY_DIALOG_LABEL,
+                  description: '报告以 Markdown 文本直接显示在对话中，不创建任何文件。',
+                },
+                {
+                  label: DELIVERY_FILE_LABEL,
+                  description: `审计结束后将报告写入 ${reportPath}；该次写入会单独请求你批准。`,
+                },
+              ],
+            }],
+            agent,
+            signal: exec.signal,
+          })
+        } catch (error: unknown) {
+          if (error instanceof UserQuestionError && error.code === 'ASK_CANCELLED') {
+            throw new Error('The user dismissed the delivery question; stay in read-only audit mode, stop, and wait for their message.')
+          }
+          throw error
+        }
+        const item = answer.answers.find(entry => entry.id === DELIVERY_QUESTION_ID)
+        const selected = item?.selected[0]
+        let delivery: AuditReportDelivery
+        if (item !== undefined && item.selected.length === 1 && selected === DELIVERY_FILE_LABEL) {
+          delivery = 'file'
+        } else if (item !== undefined && item.selected.length === 1 && selected === DELIVERY_DIALOG_LABEL) {
+          delivery = 'dialog'
+        } else {
+          throw new Error('The delivery choice was not recognized; ask the user again.')
+        }
+        agent.session.append('readonly-audit/delivery', {
+          delivery,
+          reportPath,
+        })
+        return {
+          delivery,
+          ...delivery === 'file' ? { report_path: reportPath } : {},
+        }
+      },
+      presentCall: () => ({
+        card: 'generic',
+        title: 'Audit report delivery',
+        kind: 'other',
+        content: [{ type: 'text', text: 'Asks the user how to deliver the final security audit report.' }],
+      }),
+    }))
+
+    // The optional slash command child activates only with a command registry.
+    ctx.inject(['commands'], (commandCtx) => {
+      commandCtx.commands.register({
+        name: COMMAND_NAME,
+        description: 'Enter or leave read-only security audit mode',
+        input: { hint: '[on|off|status]' },
+        handler: ({ agent, rawInput }) => this.command(agent, rawInput),
+      })
+    })
+
+    ctx.effect(() => () => {
+      disposed = true
+    }, 'readonly-security-audit: service lifetime')
+  }
+
+  /** Whether audit mode is effective for one session. */
+  private isActive(session: Session): boolean {
+    return foldAuditMode(session.events, session.events.length, this.config.active)
+  }
+
+  /** Read mode and delivery state for one live agent. */
+  get(agent: Agent): { active: boolean; delivery: AuditReportDelivery | null } {
+    return {
+      active: this.isActive(agent.session),
+      delivery: foldAuditDelivery(agent.session.events),
+    }
+  }
+
+  /** Switch one session into or out of read-only security audit mode. */
+  set(agent: Agent, active: boolean): 'committed' | 'noop' {
+    const session = agent.session
+    const current = this.isActive(session)
+    if (current === active) return 'noop'
+
+    if (active) {
+      const previousSandbox = this.ctx.sandboxPolicy.resolve({ session }).mode
+      const approval = this.ctx.get('approval')
+      const previousApproval = approval === undefined
+        ? undefined
+        : approval.overrideOf(session) ?? approval.config.policy ?? 'ask'
+      session.append('readonly-audit/mode', {
+        active: true,
+        previousSandbox,
+        ...previousApproval === undefined ? {} : { previousApproval },
+      })
+      // A fresh audit run always needs a fresh delivery choice.
+      session.append('readonly-audit/delivery', { delivery: null })
+      this.enforceStandingSandbox(session)
+      if (approval !== undefined) approval.setPolicy(agent, 'ask')
+      this.narrate(agent, true)
+      return 'committed'
+    }
+
+    const previousSandbox = foldPreviousSandbox(session.events) ?? 'workspace-write'
+    const previousApproval = foldPreviousApproval(session.events) ?? this.ctx.get('approval')?.config.policy ?? 'ask'
+    session.append('readonly-audit/mode', { active: false })
+    session.append('readonly-audit/delivery', { delivery: null })
+    if (this.ctx.sandboxPolicy.resolve({ session }).mode !== previousSandbox) {
+      setSandboxMode(session, previousSandbox)
+    }
+    const approval = this.ctx.get('approval')
+    if (approval !== undefined) approval.setPolicy(agent, previousApproval)
+    this.narrate(agent, false)
+    return 'committed'
+  }
+
+  /** `/readonly-audit` command handler. */
+  private command(agent: Agent, rawInput: string): { kind: 'success' | 'error'; text: string } {
+    const match = /^(on|off|status)(?:\s+(.*))?$/iu.exec(rawInput.trim())
+    const verb = match?.[1]?.toLowerCase()
+    if (rawInput.trim() === '' || verb === 'status') {
+      const state = this.get(agent)
+      if (!state.active) return { kind: 'success', text: 'Read-only security audit mode is off.' }
+      const delivery = state.delivery === null
+        ? 'not selected yet'
+        : state.delivery === 'file'
+          ? `file (${this.config.reportPath})`
+          : 'conversation'
+      return { kind: 'success', text: `Read-only security audit mode is on; report delivery: ${delivery}.` }
+    }
+    if (verb === 'on') {
+      const outcome = this.set(agent, true)
+      const target = match?.[2]?.trim() ?? ''
+      if (target !== '') {
+        agent.steer(createUserMessage({
+          content: [{ type: 'text', text: target }],
+          source: { kind: 'user' },
+        }))
+      }
+      return {
+        kind: 'success',
+        text: outcome === 'committed'
+          ? 'Read-only security audit mode on. The assistant will ask how to deliver the report before starting.'
+          : 'Read-only security audit mode is already on.',
+      }
+    }
+    if (verb === 'off') {
+      const outcome = this.set(agent, false)
+      return {
+        kind: 'success',
+        text: outcome === 'committed'
+          ? 'Read-only security audit mode off; the previous sandbox and approval policy were restored.'
+          : 'Read-only security audit mode is already off.',
+      }
+    }
+    return { kind: 'error', text: 'Usage: /readonly-audit [on|off|status]' }
+  }
+
+  /** The complete model-facing policy for an active audit session. */
+  private policyText(agent: Agent): string {
+    const delivery = foldAuditDelivery(agent.session.events)
+    const cwd = agent.session.header.cwd
+    const deliveryRule = delivery === null
+      ? `DELIVERY CHOICE (mandatory, before any other work): call \`${CHOOSE_DELIVERY_TOOL}\` now and wait for the user's answer. The tool offers exactly two options: "${DELIVERY_DIALOG_LABEL}" and "${DELIVERY_FILE_LABEL}". You must not choose a delivery method yourself, and you must not start reading or analyzing code before the user has chosen.`
+      : delivery === 'file'
+        ? `DELIVERY: the user chose file delivery. At the end of the audit, use the \`write\` tool once to create \`${this.config.reportPath}\` in the session workspace${cwd === undefined ? '' : ` (${cwd})`}. The system will ask the user to approve that single write; it temporarily becomes workspace-write and then returns to read-only. If the user rejects it, do NOT retry or write anywhere else — offer to paste the report into the conversation instead.`
+        : 'DELIVERY: the user chose conversation delivery. When the audit is complete, present the complete report directly in your final reply; do not create any file.'
+    return [
+      'You are in READ-ONLY SECURITY AUDIT MODE (只读安全审计模式).',
+      'The system enforces this mode at the tool and sandbox layers; prompts alone cannot override it.',
+      'Allowed work: read files, list directories, search code, view images, and run sandboxed read-only shell commands. '
+        + 'Analyze source code, dependency manifests, configuration files, and supply-chain data for vulnerabilities, dangerous APIs, weak configuration, hard-coded secrets, and supply-chain risks.',
+      deliveryRule,
+      'FORBIDDEN: modifying, creating, or deleting any file (including temporary files), running build/install/format/generation commands that write, and using any non-allowlisted tool. '
+        + 'Unauthorized mutations are rejected by the system with a "只读安全审计模式" error.',
+      'Do not write any audit working notes or intermediate artifacts to disk. Everything before the final report stays in the conversation.',
+      'REPORT CONTENT: produce one Markdown report. Every finding must contain: problem description, severity, location, evidence, and a text-only remediation suggestion. Never edit code yourself — remediation suggestions are text only.',
+      'When the audit is finished, follow the DELIVERY rule above. If anything is unclear, use ask_user_question before guessing.',
+    ].join('\n')
+  }
+
+  /** Decide one tool call in an active audit session. */
+  private async preExecute(exec: ToolExecution): Promise<PreToolDecision> {
+    const agent = requireAgent(exec)
+    const session = agent.session
+    // Audit mode is the standing policy: repair any drift before deciding a
+    // call. Exclusive mutation barriers mean no approved write can be running
+    // while an unrelated call reaches this gate.
+    this.enforceStandingSandbox(session)
+    const delivery = foldAuditDelivery(session.events)
+    const args = argsRecord(exec.arguments)
+
+    // Before delivery choice, every tool except the chooser is blocked.
+    if (delivery === null && exec.name !== CHOOSE_DELIVERY_TOOL) {
+      return {
+        kind: 'deny',
+        reason: `${READONLY_PREFIX}: 审计开始前必须先询问用户选择报告交付方式；call \`${CHOOSE_DELIVERY_TOOL}\` first and wait for the user's choice.`,
+      }
+    }
+
+    if (exec.name === CHOOSE_DELIVERY_TOOL) return { kind: 'allow' }
+
+    // `str_replace_editor` is read-only only for its `view` command.
+    if (exec.name === 'str_replace_editor' && String(args.command ?? '') === 'view') {
+      return { kind: 'allow' }
+    }
+
+    if (isFileMutation(exec.name, args, this.config.extraMutatingTools)) {
+      return await this.decideMutation(exec, args)
+    }
+
+    if (SHELL_TOOLS.has(exec.name)) {
+      const shell = this.ctx.get('shell') as { sandboxMode?: SandboxMode } | undefined
+      if (shell === undefined || shell.sandboxMode === undefined) {
+        return {
+          kind: 'deny',
+          reason: `${READONLY_PREFIX}: ${exec.name} is blocked because the mounted shell executor cannot enforce the read-only sandbox. Use read/glob/grep/str_replace_editor view instead.`,
+        }
+      }
+      // Repair drift (for example a concurrent permission-preset switch) and
+      // let the OS sandbox reject any write inside the command.
+      this.enforceStandingSandbox(session)
+      return { kind: 'allow' }
+    }
+
+    if (READONLY_TOOLS.has(exec.name) || this.config.extraReadOnlyTools.has(exec.name)) {
+      return { kind: 'allow' }
+    }
+
+    return {
+      kind: 'deny',
+      reason: `${READONLY_PREFIX}: tool "${exec.name}" is not in the read-only allowlist and was blocked by the system.`,
+    }
+  }
+
+  /**
+   * Ask for one-time approval of a mutating tool call, widen the session to
+   * `workspace-write` for exactly that call, and mark it for post-execute
+   * restoration.
+   */
+  private async decideMutation(exec: ToolExecution, args: Record<string, unknown>): Promise<PreToolDecision> {
+    const agent = requireAgent(exec)
+    const session = agent.session
+    // Always start from the standing read-only mode; this also repairs any
+    // lost post-execute restoration from a previous crashed pipeline.
+    this.enforceStandingSandbox(session)
+
+    // The built-in sandbox escalation ladder would request a second, wider
+    // grant; audit mode owns the one-time grant itself.
+    if (args.sandbox_permissions !== undefined || args.justification !== undefined) {
+      return {
+        kind: 'deny',
+        reason: `${READONLY_PREFIX}: sandbox escalation is disabled in audit mode. Retry without sandbox_permissions/justification; this single file operation has its own one-time approval.`,
+      }
+    }
+
+    const approval = this.ctx.get('approval')
+    if (approval === undefined) {
+      return {
+        kind: 'deny',
+        reason: `${READONLY_PREFIX}: no approval channel is available, so the file operation was blocked (fail closed).`,
+      }
+    }
+
+    let outcome
+    try {
+      outcome = await approval.request({
+        agent,
+        toolName: exec.name,
+        callId: exec.callId,
+        reason: `Read-only security audit mode: approve this single ${exec.name} file operation? Only this call becomes workspace-write; the session returns to read-only immediately after.`,
+        signal: exec.signal,
+      })
+    } catch (error: unknown) {
+      return {
+        kind: 'deny',
+        reason: `${READONLY_PREFIX}: the approval service failed, so the file operation was blocked (fail closed): ${messageOf(error)}`,
+      }
+    }
+
+    if (outcome !== 'allowed-once') {
+      const detail = outcome === 'rejected'
+        ? 'the user rejected the write; the file was not changed.'
+        : outcome === 'cancelled'
+          ? 'the approval question was cancelled; the write was blocked.'
+          : 'no approval answerer is available; the write was blocked (fail closed).'
+      return { kind: 'deny', reason: `${READONLY_PREFIX}: ${detail}` }
+    }
+
+    // Approved: switch only this session to workspace-write for this call.
+    setSandboxMode(session, 'workspace-write')
+    let approved = this.approvedMutations.get(session)
+    if (approved === undefined) {
+      approved = new Set()
+      this.approvedMutations.set(session, approved)
+    }
+    approved.add(exec.token)
+    return { kind: 'allow' }
+  }
+
+  /** Make the standing sandbox read-only again after an approved mutation. */
+  private restoreAfterApprovedMutation(agent: Agent, token: ToolExecutionToken): void {
+    const session = agent.session
+    const approved = this.approvedMutations.get(session)
+    if (approved === undefined) return
+    if (approved.delete(token) === false) return
+    if (approved.size > 0) return
+    try {
+      if (this.isActive(session)) this.enforceStandingSandbox(session)
+    } catch (error: unknown) {
+      this.ctx.logger.warn('readonly-security-audit: failed to restore read-only sandbox after approved write: %o', error)
+    }
+  }
+
+  /** Append `sandbox/mode: read-only` when the session drifted away. */
+  private enforceStandingSandbox(session: Session): void {
+    if (this.ctx.sandboxPolicy.resolve({ session }).mode !== 'read-only') {
+      setSandboxMode(session, 'read-only')
+    }
+  }
+
+  /** Model-facing switch notice, matching the plan-mode convention. */
+  private narrate(agent: Agent, active: boolean): void {
+    const text = active
+      ? 'The user switched this session to read-only security audit mode. Ask the user how to deliver the report before reading or analyzing anything; all file mutations are blocked by the system.'
+      : 'The user switched this session out of read-only security audit mode. Normal file permissions are restored.'
+    agent.inject(createUserMessage({
+      content: [{ type: 'text', text }],
+      // The narration is already one sentence, so it is its own summary.
+      source: { kind: 'plugin', plugin: 'readonly-security-audit', form: 'notice', summary: text },
+    }))
+  }
+}
+
+/** Require a calling agent for tools that act on session state. */
+function requireAgent(exec: ToolExecution): Agent {
+  if (exec.agent === undefined) throw new Error('read-only security audit tools require a calling agent')
+  return exec.agent
+}
+
+export default ReadonlyAuditController

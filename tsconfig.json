@@ -1,0 +1,48 @@
+{
+  "extends": "../deepseek-harness/tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "lib/types"
+  },
+  "include": [
+    "src"
+  ],
+  "references": [
+    {
+      "path": "../deepseek-harness/vendor/cordis"
+    },
+    {
+      "path": "../deepseek-harness/vendor/schemastery"
+    },
+    {
+      "path": "../deepseek-harness/packages/core/agent"
+    },
+    {
+      "path": "../deepseek-harness/packages/core/session"
+    },
+    {
+      "path": "../deepseek-harness/packages/core/system-prompt"
+    },
+    {
+      "path": "../deepseek-harness/packages/core/tools"
+    },
+    {
+      "path": "../deepseek-harness/packages/llm/llm"
+    },
+    {
+      "path": "../deepseek-harness/packages/sandbox/sandbox"
+    },
+    {
+      "path": "../deepseek-harness/packages/sandbox/sandbox-policy"
+    },
+    {
+      "path": "../deepseek-harness/packages/interaction/commands"
+    },
+    {
+      "path": "../deepseek-harness/packages/interaction/user-approval"
+    },
+    {
+      "path": "../deepseek-harness/packages/interaction/user-questions"
+    }
+  ]
+}

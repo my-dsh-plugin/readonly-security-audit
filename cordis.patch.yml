@@ -1,0 +1,13 @@
+# readonly-security-audit's dsh profile bundle patch (declared by the
+# `dsh.bundle.patch` manifest field): applied over the earlier layers when
+# this package appears in a profile's `dsh.profile.bundles` list.
+#
+# The plugin is intentionally DISABLED on the host plane. The shipped
+# `readonly-audit` agent preset mounts `dsh-readonly-security-audit` inside
+# its own isolated realm with `active: true`. Users who also want the
+# `/readonly-audit on|off` command in other presets can enable this row from
+# their profile's `cordis.patch.yml`.
+- insert:
+    - id: readonly-security-audit
+      name: dsh-readonly-security-audit
+      disabled: true
