@@ -1,5 +1,7 @@
 # readonly-security-audit
 
+[English](README.md) | 中文
+
 > ## ⚠️ 实验性项目 —— 请先阅读
 >
 > 这是只读安全审计模式的**实验性插件实现**，用于尝试「插件层相对纯预设还能
@@ -45,8 +47,6 @@
 ---
 
 DeepSeek Harness 新增的**内置“只读安全审计”模式**。它直接出现在 Agent 预设选择器中，与标准模式、PTC 模式、极简模式、创造模式并列：**只读安全审计 / Read-only audit mode**。该模式下，AI 只能阅读和分析代码、依赖与配置；任何文件写入都由系统强制拦截，只有用户对某一次写入明确批准后才放行。
-
-> English: [README.md](README.md)
 
 ## 功能
 

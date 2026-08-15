@@ -1,5 +1,7 @@
 # readonly-security-audit
 
+English | [中文](README.zh.md)
+
 > ## ⚠️ Experimental — read this first
 >
 > This is an **experimental, plugin-based** implementation of the read-only
@@ -52,8 +54,6 @@
 ---
 
 A new **read-only security audit mode** for DeepSeek Harness. It appears in the agent-preset picker beside Standard, PTC, Minimal, and Creator: **只读安全审计 / Read-only audit mode**. The assistant may read and analyze code, dependencies, and configuration, while every file mutation is rejected by the system unless the user approves one exact write.
-
-> 中文：[README.zh.md](README.zh.md)
 
 ## What it does
 
