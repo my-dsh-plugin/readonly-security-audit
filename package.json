@@ -1,6 +1,6 @@
 {
   "name": "dsh-readonly-security-audit",
-  "description": "只读安全审计模式 · Read-only Security Audit Mode for DeepSeek Harness：系统级只读拦截、逐次写入审批、强制报告交付选择；适用于任意 Harness 检出 / fork。",
+  "description": "【实验性】只读安全审计模式插件（自动只读、工具级白名单、强制交付选择）· EXPERIMENTAL plugin for the read-only security audit mode (auto read-only, tool allowlist gate, mandatory delivery choice)；日常使用推荐 dsh-presets 仓库的原生纯预设版。",
   "version": "0.1.0",
   "private": true,
   "type": "module",

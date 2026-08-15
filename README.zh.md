@@ -1,5 +1,49 @@
 # readonly-security-audit
 
+> ## ⚠️ 实验性项目 —— 请先阅读
+>
+> 这是只读安全审计模式的**实验性插件实现**，用于尝试「插件层相对纯预设还能
+> 多做哪些事情」。日常使用请优先选择**原生模式方案**：纯预设、脚本化安装的
+> 版本放在
+> [`dsh-presets`](https://github.com/my-dsh-plugin/dsh-presets) 仓库
+> （`readonly-audit/` 目录），不依赖任何自定义插件，任意主机一条命令即可安装
+> （bash / PowerShell）。详见下文「推荐替代方案」。
+>
+> ### 插件层额外尝试的能力（本次实验的内容）
+>
+> 相比原生纯预设版，本插件额外提供：
+>
+> - **自动只读** —— 进入审计模式时由插件自己将会话沙箱切到 `read-only`，
+>   部署无需把 `sandbox-policy` 默认模式配置成 read-only；
+> - **工具级白名单门禁** —— 最外层的 `tools/pre-execute` 监听器会拒绝一切
+>   非白名单工具调用，而不只是拦截文件写入；
+> - **强制报告交付选择** —— 用户未在「对话 / 文件」中选择前，模型不能开始
+>   阅读；
+> - **会话级斜杠命令** —— `/readonly-audit on|off|status`；
+> - **单次批准写入 + 自动恢复** —— 获准的报告写入只把这一次调用临时放宽到
+>   `workspace-write`，调用结束后立即恢复 `read-only`。
+>
+> 这些正是「预设文件本身无法表达」的能力。如果你确实需要它们，再安装本插件；
+> 否则优先使用下面的原生方案，更简单、更稳。
+>
+> ### 推荐替代方案（原生纯预设，脚本式安装）
+>
+> ```bash
+> bash -c "$(curl -fsSL https://raw.githubusercontent.com/my-dsh-plugin/dsh-presets/main/readonly-audit/install-readonly-audit.sh)"
+> ```
+>
+> Windows PowerShell：
+>
+> ```powershell
+> irm https://raw.githubusercontent.com/my-dsh-plugin/dsh-presets/main/readonly-audit/install-readonly-audit.ps1 | iex
+> ```
+>
+> 取舍：原生版**没有自动只读** —— 部署的 `sandbox-policy` 默认模式必须已是
+> `read-only`（或会话手动切换），也没有工具级白名单门禁与强制交付选择；但它
+> 挂载的一切在强制层依然是完全只读的。
+
+---
+
 DeepSeek Harness 新增的**内置“只读安全审计”模式**。它直接出现在 Agent 预设选择器中，与标准模式、PTC 模式、极简模式、创造模式并列：**只读安全审计 / Read-only audit mode**。该模式下，AI 只能阅读和分析代码、依赖与配置；任何文件写入都由系统强制拦截，只有用户对某一次写入明确批准后才放行。
 
 > English: [README.md](README.md)

@@ -1,6 +1,57 @@
 # readonly-security-audit
 
-A new built-in **read-only security audit mode** for DeepSeek Harness. It appears in the agent-preset picker beside Standard, PTC, Minimal, and Creator: **只读安全审计 / Read-only audit mode**. The assistant may read and analyze code, dependencies, and configuration, while every file mutation is rejected by the system unless the user approves one exact write.
+> ## ⚠️ Experimental — read this first
+>
+> This is an **experimental, plugin-based** implementation of the read-only
+> security audit mode. It exists to try out what a plugin layer can add **on
+> top of** a plain preset. For everyday use, prefer the **native preset
+> approach**: a pure-preset, script-installable edition lives in the
+> [`dsh-presets`](https://github.com/my-dsh-plugin/dsh-presets) repository
+> (`readonly-audit/`), needs no custom plugin, and installs with one command
+> on any host (bash / PowerShell). See the "Recommended alternative" section
+> below.
+>
+> ### What the plugin layer adds (the experiment)
+>
+> Compared with the native pure-preset edition, this plugin attempts:
+>
+> - **Automatic read-only** — entering audit mode switches the session's
+>   sandbox to `read-only` by itself, so the deployment does not need to
+>   configure `sandbox-policy` to a read-only default;
+> - **Tool-level allowlist gate** — an outermost `tools/pre-execute` listener
+>   rejects every non-allowlisted tool call, not just filesystem mutations;
+> - **Mandatory report-delivery choice** — the model cannot start reading
+>   before the user picks conversation or file delivery;
+> - **Per-session slash commands** — `/readonly-audit on|off|status`;
+> - **One-shot write approval with auto-restore** — an approved report write
+>   widens only that single call to `workspace-write` and restores
+>   `read-only` immediately after.
+>
+> These are exactly the capabilities a preset file alone cannot express.
+> If they matter to you, install this plugin; otherwise the native preset
+> edition below is the recommended, simpler path.
+>
+> ### Recommended alternative (native preset, scripted install)
+>
+> ```bash
+> bash -c "$(curl -fsSL https://raw.githubusercontent.com/my-dsh-plugin/dsh-presets/main/readonly-audit/install-readonly-audit.sh)"
+> ```
+>
+> Windows PowerShell:
+>
+> ```powershell
+> irm https://raw.githubusercontent.com/my-dsh-plugin/dsh-presets/main/readonly-audit/install-readonly-audit.ps1 | iex
+> ```
+>
+> Trade-off: the native edition has **no automatic read-only** — the
+> deployment's `sandbox-policy` default must already be `read-only` (or the
+> session must be switched manually), and there is no tool-level allowlist
+> gate or mandatory delivery choice. It is still fully read-only at the
+> enforcement layer for everything it mounts.
+
+---
+
+A new **read-only security audit mode** for DeepSeek Harness. It appears in the agent-preset picker beside Standard, PTC, Minimal, and Creator: **只读安全审计 / Read-only audit mode**. The assistant may read and analyze code, dependencies, and configuration, while every file mutation is rejected by the system unless the user approves one exact write.
 
 > 中文：[README.zh.md](README.zh.md)
 
