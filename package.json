@@ -1,6 +1,6 @@
 {
   "name": "dsh-readonly-security-audit",
-  "description": "DeepSeek Harness plugin and agent preset: a built-in read-only security audit mode with system-enforced write blocking, mandatory report-delivery choice, and one-shot approved report-file writes.",
+  "description": "只读安全审计模式 · Read-only Security Audit Mode for DeepSeek Harness：系统级只读拦截、逐次写入审批、强制报告交付选择；适用于任意 Harness 检出 / fork。",
   "version": "0.1.0",
   "private": true,
   "type": "module",
