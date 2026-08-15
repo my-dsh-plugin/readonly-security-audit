@@ -527,11 +527,10 @@ export class ReadonlyAuditController extends Service {
   /** The complete model-facing policy for an active audit session. */
   private policyText(agent: Agent): string {
     const delivery = foldAuditDelivery(agent.session.events)
-    const cwd = agent.session.header.cwd
     const deliveryRule = delivery === null
       ? `DELIVERY CHOICE (mandatory, before any other work): call \`${CHOOSE_DELIVERY_TOOL}\` now and wait for the user's answer. The tool offers exactly two options: "${DELIVERY_DIALOG_LABEL}" and "${DELIVERY_FILE_LABEL}". You must not choose a delivery method yourself, and you must not start reading or analyzing code before the user has chosen.`
       : delivery === 'file'
-        ? `DELIVERY: the user chose file delivery. At the end of the audit, use the \`write\` tool once to create \`${this.config.reportPath}\` in the session workspace${cwd === undefined ? '' : ` (${cwd})`}. The system will ask the user to approve that single write; it temporarily becomes workspace-write and then returns to read-only. If the user rejects it, do NOT retry or write anywhere else — offer to paste the report into the conversation instead.`
+        ? `DELIVERY: the user chose file delivery. At the end of the audit, use the \`write\` tool once to create \`${this.config.reportPath}\` in the session workspace. The system will ask the user to approve that single write; it temporarily becomes workspace-write and then returns to read-only. If the user rejects it, do NOT retry or write anywhere else — offer to paste the report into the conversation instead.`
         : 'DELIVERY: the user chose conversation delivery. When the audit is complete, present the complete report directly in your final reply; do not create any file.'
     return [
       'You are in READ-ONLY SECURITY AUDIT MODE (只读安全审计模式).',
