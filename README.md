@@ -233,6 +233,26 @@ cp /path/to/readonly-security-audit/presets/readonly-audit/* \
 The only consistency rule is: **the plugin, the preset, and the Harness process
 must all use the same `DSH_HOME`.**
 
+### DeepSeek Harness Desktop — one-shot install
+
+Desktop users need no checkout: the desktop harness (built from the my-dsh-plugin fork) and
+its seeded home already ship the `readonly-audit` preset. Run this once in a **normal
+terminal** (not inside the app's own harness shell — the app bundle and app-data dir are
+sandboxed/read-only from there, especially on macOS):
+
+```sh
+bash <(curl -Ls https://raw.githubusercontent.com/my-dsh-plugin/readonly-security-audit/main/scripts/install-desktop.sh) --restart
+```
+
+The script is idempotent: pulls the plugin from GitHub (prebuilt `lib/`, nothing to build),
+installs it into the desktop web profile, registers the bundle, and restarts the app
+(`--restart`). It has no settings namespace, so no allowlist patch is needed. After
+restarting, pick **只读安全审计 / Read-only audit mode** from the preset picker on a new
+session. Overrides: `DSH_DESKTOP_APP`, `DSH_DESKTOP_HOME`, `DSH_SKILL_SOURCE_DIR`.
+
+> End users of a released desktop build need no manual steps — upgrade and restart; the
+> plugin is seeded and the preset is already in the shipped home.
+
 ## Use
 
 1. Create a session and select **只读安全审计 / Read-only audit mode** from the preset picker.

@@ -222,6 +222,24 @@ cp /path/to/readonly-security-audit/presets/readonly-audit/* \
 
 唯一的一致性要求是：**插件、预设、Harness 进程必须使用同一个 `DSH_HOME`。**
 
+### DeepSeek Harness Desktop(桌面端)一键安装
+
+桌面端用户无需 checkout:桌面端 harness(由 my-dsh-plugin fork 构建)及其 seed 的 home
+已自带 `readonly-audit` 预设。在**普通终端**执行一次(不要在 App 自带的 harness 会话里
+跑——那里的应用安装目录和 App 数据目录是沙箱/只读的,macOS 尤其如此):
+
+```sh
+bash <(curl -Ls https://raw.githubusercontent.com/my-dsh-plugin/readonly-security-audit/main/scripts/install-desktop.sh) --restart
+```
+
+脚本幂等:从 GitHub 拉取插件(预编译 `lib/`,无需构建);装入桌面 web profile 并注册
+bundle;`--restart` 重启 App。该插件没有设置命名空间,因此无需白名单补丁。重启后新建
+会话,在预设选择器中选择 **只读安全审计 / Read-only audit mode** 即可。
+可用环境变量覆盖:`DSH_DESKTOP_APP`、`DSH_DESKTOP_HOME`、`DSH_SKILL_SOURCE_DIR`。
+
+> 使用已发布桌面包的最终用户无需任何手动步骤 —— 升级重启即可;插件已 seed,预设已在
+> 随包 home 中。
+
 ## 使用
 
 1. 新建会话时，在预设选择器中选择 **只读安全审计 / Read-only audit mode**。
